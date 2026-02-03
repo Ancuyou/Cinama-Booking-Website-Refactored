@@ -1,0 +1,11 @@
+.login-container {
+  min-height: 80vh;
+  background-color: #f8f9fa;
+}
+.login-form-container {
+  width: 100%;
+  max-width: 450px;
+  background: white;
+  border-radius: 8px;
+  box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+}
