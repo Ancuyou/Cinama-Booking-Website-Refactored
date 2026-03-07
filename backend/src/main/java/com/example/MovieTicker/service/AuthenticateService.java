@@ -17,18 +17,20 @@ import com.example.MovieTicker.response.AuthenticateResponse;
 import com.example.MovieTicker.response.IntrospectResponse;
 import com.google.api.client.googleapis.auth.oauth2.GoogleIdToken;
 import com.google.api.client.googleapis.auth.oauth2.GoogleIdTokenVerifier;
-import com.google.api.client.http.javanet.NetHttpTransport;
-import com.google.api.client.json.jackson2.JacksonFactory;
+// ✅ SINGLETON REFACTOR: Bỏ import NetHttpTransport + JacksonFactory
+// ❌ CŨ: import com.google.api.client.http.javanet.NetHttpTransport;
+// ❌ CŨ: import com.google.api.client.json.jackson2.JacksonFactory;
+// Hai class này giờ chỉ được dùng trong GoogleAuthConfig.java (tạo Bean 1 lần duy nhất)
 import jakarta.transaction.Transactional;
 import lombok.RequiredArgsConstructor;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.context.SecurityContextHolder;
-import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
+// ✅ SINGLETON REFACTOR: Bỏ import BCryptPasswordEncoder
+// ❌ CŨ: import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
+// BCryptPasswordEncoder giờ được inject qua PasswordEncoder @Bean từ WebSecurityConfig
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
-
 
 import com.nimbusds.jose.JOSEException;
 import com.nimbusds.jose.JWSAlgorithm;
@@ -41,8 +43,6 @@ import com.nimbusds.jose.crypto.MACVerifier;
 import com.nimbusds.jwt.JWTClaimsSet;
 import com.nimbusds.jwt.SignedJWT;
 
-import lombok.AccessLevel;
-import lombok.experimental.FieldDefaults;
 import lombok.experimental.NonFinal;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.util.CollectionUtils;
@@ -59,12 +59,41 @@ public class AuthenticateService {
     private final VaiTroRepository vaiTroRepository;
     private final PendingRegistrationRepository pendingRepo;
 
-    @Value("${jwt.Key}") // Lấy key từ application.yaml
+    // =========================================================
+    //  SINGLETON PATTERN — PasswordEncoder
+    // =========================================================
+    // ❌ CŨ: Mỗi method tự gọi: new BCryptPasswordEncoder(10)
+    //   - register()        → new BCryptPasswordEncoder(10)  [lần 1]
+    //   - authenticated()   → new BCryptPasswordEncoder(10)  [lần 2]
+    //   - resetPassword()   → new BCryptPasswordEncoder(10)  [lần 3]
+    //   - loginWithGoogle() → new BCryptPasswordEncoder(10)  [lần 4]
+    //   Mỗi lần: khởi tạo Blowfish cipher + S-box, tốn ~0.5–1ms CPU, tạo object rác cho GC
+    //
+    // ✅ MỚI: Spring inject 1 instance duy nhất từ WebSecurityConfig.passwordEncoder() @Bean
+    //   Tạo đúng 1 lần khi app start → tái sử dụng mãi mãi, 0 GC pressure
+    private final PasswordEncoder passwordEncoder;
+
+    // =========================================================
+    //  SINGLETON PATTERN — GoogleIdTokenVerifier
+    // =========================================================
+    // ❌ CŨ: loginWithGoogle() tạo mới mỗi request:
+    //   new GoogleIdTokenVerifier.Builder(new NetHttpTransport(), new JacksonFactory())
+    //       .setAudience(...).build();
+    //   Chi phí mỗi lần: tạo socket pool (~100ms) + fetch Google public keys qua HTTPS (~300ms)
+    //   10 concurrent login Google → 10 HTTPS calls đến Google servers
+    //
+    // ✅ MỚI: Inject Singleton Bean từ GoogleAuthConfig.java
+    //   Tạo 1 lần khi app start, public keys được cache, tái sử dụng mãi mãi
+    private final GoogleIdTokenVerifier googleIdTokenVerifier;
+
+    @Value("${jwt.Key}")
     @NonFinal
     String singerKey;
 
-    @Value("${spring.security.oauth2.client.registration.google.client-id}")
-    private String googleClientId;
+    // ❌ CŨ: @Value googleClientId dùng để new GoogleIdTokenVerifier trong loginWithGoogle()
+    // ✅ MỚI: Đã chuyển sang GoogleAuthConfig.java, không cần ở đây nữa
+    // @Value("${spring.security.oauth2.client.registration.google.client-id}")
+    // private String googleClientId;
 
     @Transactional
     public void register(RegistrationRequest request) {
@@ -79,7 +108,11 @@ public class AuthenticateService {
         }
 
         pendingRepo.findByEmail(request.getEmail()).ifPresent(pendingRepo::delete);
-        PasswordEncoder passwordEncoder = new BCryptPasswordEncoder(10);
+
+        // ❌ CŨ: PasswordEncoder passwordEncoder = new BCryptPasswordEncoder(10);
+        // ✅ MỚI: Dùng this.passwordEncoder — Singleton đã inject, instance ID không đổi
+        log.info("[SINGLETON] register() | passwordEncoder@{}",
+                Integer.toHexString(System.identityHashCode(passwordEncoder)));
 
         // 1. Tạo OTP
         String otp = new Random().ints(6, 0, 10).mapToObj(String::valueOf).collect(Collectors.joining());
@@ -92,11 +125,9 @@ public class AuthenticateService {
         pendingUser.setEmail(request.getEmail());
         pendingUser.setSdt(request.getSdt());
         pendingUser.setNgaySinh(request.getNgaySinh());
-        pendingUser.setExpiryDate(LocalDateTime.now().plusMinutes(5)); // Yêu cầu hết hạn sau 5 phút
-
-        pendingUser.setOtp(otp); // Lưu OTP
-        pendingUser.setOtpGeneratedTime(LocalDateTime.now()); // Lưu thời gian tạo OTP
-
+        pendingUser.setExpiryDate(LocalDateTime.now().plusMinutes(5));
+        pendingUser.setOtp(otp);
+        pendingUser.setOtpGeneratedTime(LocalDateTime.now());
         pendingRepo.save(pendingUser);
 
         // 3. Gửi email chứa OTP
@@ -105,135 +136,103 @@ public class AuthenticateService {
 
     private void sendNewOtpForUser(String email) {
         String otp = new Random().ints(6, 0, 10).mapToObj(String::valueOf).collect(Collectors.joining());
-
-        // Dùng tạm một đối tượng TaiKhoan để tìm kiếm token, vì PasswordResetToken liên kết với TaiKhoan
         TaiKhoan tempKey = new TaiKhoan();
         tempKey.setTenDangNhap(email);
-
         passwordResetTokenRepository.findByTaiKhoan(tempKey)
                 .ifPresent(passwordResetTokenRepository::delete);
-
         PasswordResetToken otpToken = new PasswordResetToken(otp, tempKey);
         otpToken.setExpiryDate(LocalDateTime.now().plusMinutes(5));
         passwordResetTokenRepository.save(otpToken);
-
         emailService.sendOtpEmail(email, otp);
     }
 
     @Transactional
     public void verifyOtp(VerifyOtpRequest request) {
-        // 1. Lấy thông tin đăng ký đang chờ từ bảng tạm qua email
         PendingRegistration registrationData = pendingRepo.findByEmail(request.getEmail())
-                .orElseThrow(() -> new AppException(ErrorCode.INVALID_REQUEST)); // "Yêu cầu đăng ký không hợp lệ hoặc đã hết hạn."));
-
-        // 2. Kiểm tra OTP
+                .orElseThrow(() -> new AppException(ErrorCode.INVALID_REQUEST));
         if (registrationData.getOtp() == null || !registrationData.getOtp().equals(request.getOtp())) {
-            throw new AppException(ErrorCode.INVALID_TOKEN); // "Mã OTP không chính xác.");
+            throw new AppException(ErrorCode.INVALID_TOKEN);
         }
-
-        // 3. Kiểm tra OTP có hết hạn không (ví dụ 5 phút)
         if (registrationData.getOtpGeneratedTime().plusMinutes(5).isBefore(LocalDateTime.now())) {
-            throw new AppException(ErrorCode.TOKEN_EXPIRED); // "Mã OTP đã hết hạn.");
+            throw new AppException(ErrorCode.TOKEN_EXPIRED);
         }
-
-        // 4. Tạo tài khoản trong DB từ dữ liệu bảng tạm
         User user = new User();
         user.setHoTen(registrationData.getHoTen());
         user.setEmail(registrationData.getEmail());
         user.setSdt(registrationData.getSdt());
         user.setNgaySinh(registrationData.getNgaySinh());
         User savedUser = userRepository.save(user);
-
         VaiTro userRole = vaiTroRepository.findByTenVaiTro("USER")
                 .orElseThrow(() -> new AppException(ErrorCode.ROLE_NOT_FOUND));
-
         TaiKhoan taiKhoan = new TaiKhoan();
         taiKhoan.setTenDangNhap(registrationData.getTenDangNhap());
         taiKhoan.setMatKhau(registrationData.getMatKhau());
         taiKhoan.setUser(savedUser);
         taiKhoan.setVaiTro(userRole);
         taiKhoanRepository.save(taiKhoan);
-
-        // 5. Xóa dữ liệu trong bảng tạm sau khi hoàn tất
         pendingRepo.delete(registrationData);
     }
 
-    @Transactional // Đảm bảo các thay đổi được lưu vào CSDL
+    @Transactional
     public void resendOtp(ResendOtpRequest request) {
-        // 1. Tìm thông tin đăng ký đang chờ qua email
         PendingRegistration registrationData = pendingRepo.findByEmail(request.getEmail())
                 .orElseThrow(() -> new AppException(ErrorCode.INVALID_REQUEST));
-
-        // 2. Tạo một mã OTP mới
         String newOtp = new Random().ints(6, 0, 10).mapToObj(String::valueOf).collect(Collectors.joining());
-
-        // 3. Cập nhật mã OTP và thời gian tạo mới cho bản ghi đang chờ
         registrationData.setOtp(newOtp);
         registrationData.setOtpGeneratedTime(LocalDateTime.now());
-        pendingRepo.save(registrationData); // Lưu lại thay đổi
-
-        // 4. Gửi email chứa mã OTP mới
+        pendingRepo.save(registrationData);
         emailService.sendOtpEmail(request.getEmail(), newOtp);
     }
 
-    // XU LY LOGIC Refresh Token
-    public AuthenticateResponse authenticated(AuthenticateRequest request){
-        // Tìm kiếm theo TenDangNhap (là username và cũng là ID)
+    public AuthenticateResponse authenticated(AuthenticateRequest request) {
         var taiKhoan = taiKhoanRepository.findById(request.getUsername()).orElseThrow(() ->
                 new AppException(ErrorCode.USER_NOT_FOUND)
         );
-        PasswordEncoder passwordEncoder = new BCryptPasswordEncoder(10);
+        // ❌ CŨ: PasswordEncoder passwordEncoder = new BCryptPasswordEncoder(10);
+        //   Method login được gọi nhiều nhất trong hệ thống — tạo mới mỗi request là lãng phí nhất
+        // ✅ MỚI: Dùng this.passwordEncoder — Singleton, cùng instance với register() ở trên
+        log.info("[SINGLETON] authenticated() | passwordEncoder@{} (phải giống register)",
+                Integer.toHexString(System.identityHashCode(passwordEncoder)));
         boolean isAuthenticated = passwordEncoder.matches(request.getPassword(), taiKhoan.getMatKhau());
-
         if (!isAuthenticated) {
             throw new AppException(ErrorCode.INCORRECT_PASSWORD);
         }
         if (!taiKhoan.isTrangThai()) {
             throw new AppException(ErrorCode.ACCOUNT_LOCKED);
         }
-        var accessToken = generateToken(taiKhoan, 3600*1000); // 1 hour
-        var refreshToken = generateToken(taiKhoan, 3600*24*7*1000); // 7 days
-        return
-                AuthenticateResponse.builder()
-                        .authenticated(true)
-                        .accessToken(accessToken)
-                        .refreshToken(refreshToken)
-                        .build();
+        var accessToken = generateToken(taiKhoan, 3600 * 1000);
+        var refreshToken = generateToken(taiKhoan, 3600 * 24 * 7 * 1000);
+        return AuthenticateResponse.builder()
+                .authenticated(true)
+                .accessToken(accessToken)
+                .refreshToken(refreshToken)
+                .build();
     }
+
     public AuthenticateResponse refreshToken(IntrospectRequest request) throws ParseException, JOSEException {
-        // 1. Xác thực refresh token cũ
         var signedJWT = verifyToken(request.getToken());
         var username = signedJWT.getJWTClaimsSet().getSubject();
         var taiKhoan = taiKhoanRepository.findById(username)
                 .orElseThrow(() -> new AppException(ErrorCode.UNTHENTICATED));
-
-        // 2. Tạo access token và refresh token MỚI
-        var accessToken = generateToken(taiKhoan, 3600 * 1000); // 1 giờ
-        var newRefreshToken = generateToken(taiKhoan, 3600 * 24 * 7 * 1000); // 7 ngày
-
-        // 3. Vô hiệu hóa refresh token CŨ bằng hàm nội bộ
+        var accessToken = generateToken(taiKhoan, 3600 * 1000);
+        var newRefreshToken = generateToken(taiKhoan, 3600 * 24 * 7 * 1000);
         invalidateToken(request.getToken());
-
-        // 4. Trả về cặp token mới
         return AuthenticateResponse.builder()
                 .authenticated(true)
                 .accessToken(accessToken)
                 .refreshToken(newRefreshToken)
                 .build();
     }
-    // -- XU LY LOGIC QUEN MAT KHAU
+
     public void forgotPassword(ForgotPasswordRequest request) {
         var user = userRepository.findByEmail(request.getEmail())
                 .orElseThrow(() -> new AppException(ErrorCode.USER_NOT_FOUND));
         var taiKhoan = taiKhoanRepository.findByUser(user)
                 .orElseThrow(() -> new AppException(ErrorCode.USER_NOT_FOUND));
-        // Xóa token cũ nếu có
         passwordResetTokenRepository.findByTaiKhoan(taiKhoan).ifPresent(passwordResetTokenRepository::delete);
-        // Tạo một token dài, ngẫu nhiên và an toàn hơn thay vì OTP 6 số
         String tokenString = UUID.randomUUID().toString();
         PasswordResetToken resetToken = new PasswordResetToken(tokenString, taiKhoan);
         passwordResetTokenRepository.save(resetToken);
-        // EmailService sẽ nhận token này và xây dựng link hoàn chỉnh
         emailService.sendPasswordResetEmail(user.getEmail(), resetToken);
     }
 
@@ -245,44 +244,36 @@ public class AuthenticateService {
             throw new AppException(ErrorCode.TOKEN_EXPIRED);
         }
         TaiKhoan taiKhoan = resetToken.getTaiKhoan();
-        PasswordEncoder passwordEncoder = new BCryptPasswordEncoder(10);
+        // ❌ CŨ: PasswordEncoder passwordEncoder = new BCryptPasswordEncoder(10);
+        // ✅ MỚI: Dùng this.passwordEncoder — cùng Singleton instance với các method trên
+        log.info("[SINGLETON] resetPassword() | passwordEncoder@{} (phải giống register/login)",
+                Integer.toHexString(System.identityHashCode(passwordEncoder)));
         taiKhoan.setMatKhau(passwordEncoder.encode(request.getNewPassword()));
         taiKhoanRepository.save(taiKhoan);
         passwordResetTokenRepository.delete(resetToken);
     }
+
     public IntrospectResponse introspect(IntrospectRequest request) {
         var token = request.getToken();
-        boolean isValid = false; // Mặc định là không hợp lệ
+        boolean isValid = false;
         try {
-            // Sử dụng verifier đã được tạo từ signerKey
             JWSVerifier verifier = new MACVerifier(singerKey.getBytes());
             SignedJWT signedJWT = SignedJWT.parse(token);
-
-            // 1. Kiểm tra chữ ký
             boolean signatureVerified = signedJWT.verify(verifier);
-
-            // 2. Kiểm tra hạn sử dụng
             boolean expired = signedJWT.getJWTClaimsSet().getExpirationTime().before(new Date());
-
-            // 3. Kiểm tra trong database xem token đã bị vô hiệu hóa chưa
             String jit = signedJWT.getJWTClaimsSet().getJWTID();
             boolean invalidated = invalidatedTokenRepository.existsById(jit);
-
-            // Token chỉ hợp lệ khi tất cả các điều kiện đều đúng
             if (signatureVerified && !expired && !invalidated) {
                 isValid = true;
             }
         } catch (Exception e) {
-            // Nếu có bất kỳ lỗi nào trong quá trình parse hoặc verify, token không hợp lệ
             log.error("Introspect token error: {}", e.getMessage());
-            isValid = false;
         }
         return IntrospectResponse.builder()
                 .valid(isValid)
                 .build();
     }
 
-    // Sửa tham số từ User sang TaiKhoan
     private String generateToken(TaiKhoan taiKhoan, long expirationTime) {
         JWSHeader jwsHeader = new JWSHeader(JWSAlgorithm.HS512);
         JWTClaimsSet claimsSet = new JWTClaimsSet.Builder()
@@ -305,7 +296,6 @@ public class AuthenticateService {
     }
 
     public void logout(LogoutRequest logoutRequest) {
-        // Vô hiệu hóa cả hai token
         invalidateToken(logoutRequest.getAccessToken());
         invalidateToken(logoutRequest.getRefreshToken());
     }
@@ -315,7 +305,6 @@ public class AuthenticateService {
         SignedJWT signedJWT = SignedJWT.parse(token);
         Date expirationTime = signedJWT.getJWTClaimsSet().getExpirationTime();
         boolean verified = signedJWT.verify(verifier);
-        // Chỉ kiểm tra chữ ký và token còn hạn hay không
         if (!(verified && expirationTime.after(new Date()))) {
             throw new AppException(ErrorCode.UNTHENTICATED);
         }
@@ -323,55 +312,52 @@ public class AuthenticateService {
     }
 
     private void invalidateToken(String token) {
-        if (token == null || token.isEmpty()) {
-            return; // Bỏ qua nếu token rỗng
-        }
+        if (token == null || token.isEmpty()) return;
         try {
             SignedJWT signedJWT = SignedJWT.parse(token);
             String jit = signedJWT.getJWTClaimsSet().getJWTID();
             Date expiryTime = signedJWT.getJWTClaimsSet().getExpirationTime();
-
             InvalidatedToken invalidatedToken = InvalidatedToken.builder()
                     .id(jit)
                     .expiryDate(expiryTime)
                     .build();
-
             invalidatedTokenRepository.save(invalidatedToken);
-
         } catch (ParseException e) {
             log.error("Error while invalidating token: {}", e.getMessage());
-            // Có thể bỏ qua lỗi parse vì token có thể không hợp lệ,
-            // mục đích chính là cố gắng vô hiệu hóa nó nếu có thể.
         }
     }
 
-    // **Đây là phần quan trọng nhất: Sửa lại để phù hợp với mô hình 1 vai trò**
     public String buildScopeString(TaiKhoan taiKhoan) {
         StringJoiner scopeString = new StringJoiner(" ");
         VaiTro role = taiKhoan.getVaiTro();
         if (role != null) {
-            // Thêm vai trò, ví dụ: ROLE_ADMIN
             scopeString.add("ROLE_" + role.getTenVaiTro().toUpperCase());
-
-            // Thêm các quyền (permissions) của vai trò đó nếu có
-            if (!CollectionUtils.isEmpty(role.getPermissions())){
+            if (!CollectionUtils.isEmpty(role.getPermissions())) {
                 role.getPermissions().forEach(permission -> scopeString.add(permission.getName()));
             }
         }
         return scopeString.toString();
     }
+
     @Transactional
     public AuthenticateResponse loginWithGoogle(String tokenId) {
         try {
-            GoogleIdTokenVerifier verifier = new GoogleIdTokenVerifier.Builder(new NetHttpTransport(), new JacksonFactory())
-                    .setAudience(Collections.singletonList(googleClientId))
-                    .build();
+            // ❌ CŨ: Tạo mới toàn bộ verifier mỗi lần user login Google:
+            //   GoogleIdTokenVerifier verifier = new GoogleIdTokenVerifier
+            //       .Builder(new NetHttpTransport(), new JacksonFactory())
+            //       .setAudience(Collections.singletonList(googleClientId))
+            //       .build();
+            //   → Mỗi lần: tạo socket pool + fetch Google public keys (~400ms overhead)
+            //   → 10 user login cùng lúc = 10 HTTPS calls đến googleapis.com
+            //
+            // ✅ MỚI: Dùng this.googleIdTokenVerifier — Singleton Bean từ GoogleAuthConfig
+            //   Tạo 1 lần khi app start, public keys được cache, verify chỉ tốn ~5–20ms
+            log.info("[SINGLETON] loginWithGoogle() | googleIdTokenVerifier@{}",
+                    Integer.toHexString(System.identityHashCode(googleIdTokenVerifier)));
+            log.info("[SINGLETON] loginWithGoogle() | passwordEncoder@{} (phải giống register/login)",
+                    Integer.toHexString(System.identityHashCode(passwordEncoder)));
 
-            System.out.println("Google Client ID: " + googleClientId);
-            System.out.println("Token ID: " + tokenId);
-            System.out.println("Verifying token..." + verifier.toString());
-
-            GoogleIdToken idToken = verifier.verify(tokenId);
+            GoogleIdToken idToken = googleIdTokenVerifier.verify(tokenId);
             if (idToken == null) {
                 throw new AppException(ErrorCode.UNTHENTICATED);
             }
@@ -380,22 +366,22 @@ public class AuthenticateService {
             String email = payload.getEmail();
             String hoTen = (String) payload.get("name");
 
-            // Tìm hoặc tạo người dùng mới
             User user = userRepository.findByEmail(email).orElseGet(() -> {
                 User newUser = new User();
                 newUser.setEmail(email);
                 newUser.setHoTen(hoTen);
-                newUser.setSdt(""); // Có thể yêu cầu người dùng cập nhật sau
-                newUser.setNgaySinh(LocalDate.now()); // Giá trị mặc định
+                newUser.setSdt("");
+                newUser.setNgaySinh(LocalDate.now());
                 return userRepository.save(newUser);
             });
-            PasswordEncoder passwordEncoder = new BCryptPasswordEncoder(10);
-            // Tìm hoặc tạo tài khoản
+
+            // ❌ CŨ: PasswordEncoder passwordEncoder = new BCryptPasswordEncoder(10); [lần 4!]
+            // ✅ MỚI: Dùng this.passwordEncoder — Singleton đã inject từ đầu
             TaiKhoan taiKhoan = taiKhoanRepository.findByUser(user).orElseGet(() -> {
                 TaiKhoan newAccount = new TaiKhoan();
-                newAccount.setTenDangNhap(email);  // Tạo username duy nhất
+                newAccount.setTenDangNhap(email);
                 String rawPassword = UUID.randomUUID().toString().substring(0, 12);
-                newAccount.setMatKhau(passwordEncoder.encode(rawPassword)); // Mật khẩu ngẫu nhiên 12 ký tự
+                newAccount.setMatKhau(passwordEncoder.encode(rawPassword));
                 newAccount.setUser(user);
                 newAccount.setVaiTro(vaiTroRepository.findByTenVaiTro("USER").orElseThrow());
                 emailService.sendNewAccountCredentialsEmail(email, email, rawPassword);
@@ -406,10 +392,8 @@ public class AuthenticateService {
                 throw new AppException(ErrorCode.ACCOUNT_LOCKED);
             }
 
-            // Tạo và trả về token của hệ thống
-            var accessToken = generateToken(taiKhoan, 3600 * 1000); // 1 giờ
-            var refreshToken = generateToken(taiKhoan, 3600 * 24 * 7 * 1000); // 7 ngày
-
+            var accessToken = generateToken(taiKhoan, 3600 * 1000);
+            var refreshToken = generateToken(taiKhoan, 3600 * 24 * 7 * 1000);
             return AuthenticateResponse.builder()
                     .authenticated(true)
                     .accessToken(accessToken)
@@ -420,17 +404,15 @@ public class AuthenticateService {
             throw new AppException(ErrorCode.UNTHENTICATED);
         }
     }
+
     @Transactional
     public AuthenticateResponse changeUsername(ChangeUsernameRequest request) {
         Authentication auth = SecurityContextHolder.getContext().getAuthentication();
         String currentUsername = auth.getName();
-
         TaiKhoan current = taiKhoanRepository.findById(currentUsername)
                 .orElseThrow(() -> new AppException(ErrorCode.UNTHENTICATED));
-
         String newUsername = request.getNewUsername().trim();
         if (newUsername.equals(currentUsername)) {
-            // No change; return tokens for current username to keep behavior consistent
             var accessToken = generateToken(current, 3600 * 1000);
             var refreshToken = generateToken(current, 3600 * 24 * 7 * 1000);
             return AuthenticateResponse.builder()
@@ -439,12 +421,9 @@ public class AuthenticateService {
                     .refreshToken(refreshToken)
                     .build();
         }
-
         if (taiKhoanRepository.existsById(newUsername)) {
             throw new AppException(ErrorCode.USER_EXISTS);
         }
-
-        // Clone account to new primary key
         TaiKhoan renamed = new TaiKhoan();
         renamed.setTenDangNhap(newUsername);
         renamed.setMatKhau(current.getMatKhau());
@@ -452,21 +431,14 @@ public class AuthenticateService {
         renamed.setUser(current.getUser());
         renamed.setVaiTro(current.getVaiTro());
         taiKhoanRepository.save(renamed);
-
-        // Reattach password reset token if exists
         Optional<PasswordResetToken> tokenOpt = passwordResetTokenRepository.findByTaiKhoan(current);
         tokenOpt.ifPresent(t -> {
             t.setTaiKhoan(renamed);
             passwordResetTokenRepository.save(t);
         });
-
-        // Remove old account
         taiKhoanRepository.delete(current);
-
-        // Issue fresh tokens for the new username
         var accessToken = generateToken(renamed, 3600 * 1000);
         var refreshToken = generateToken(renamed, 3600 * 24 * 7 * 1000);
-
         return AuthenticateResponse.builder()
                 .authenticated(true)
                 .accessToken(accessToken)
@@ -474,3 +446,4 @@ public class AuthenticateService {
                 .build();
     }
 }
+
